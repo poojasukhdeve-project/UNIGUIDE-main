@@ -1,0 +1,623 @@
+import sqlite3
+def init_db(db_path="C:/Uniguide/db/uniguide.sqlite"):
+    conn = sqlite3.connect(db_path, timeout=10, check_same_thread=False)
+    return conn
+
+
+# Initializing the database connection
+conn = init_db("C:/Uniguide/db/uniguide.sqlite")  # Use the actual path to your SQLite file
+
+import openai
+import requests
+
+
+
+
+
+CAMPUS_CITY = "Boston"
+
+client = OpenAI(api_key="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")  # TODO: Insert your OpenAI API key here :contentReference[oaicite:3]{index=3}
+WEATHER_API_KEY = "880dbf81f1bbddf4865779b93ab2184b"
+
+def get_weather(city):
+    """
+    Fetch current weather for the given city using OpenWeatherMap API.
+    Returns a tuple (description, temperature) or None if not available.
+    """
+    if not WEATHER_API_KEY:
+        # No API key provided
+        return None
+    try:
+        base_url = "http://api.openweathermap.org/data/2.5/weather"
+        # We request results in metric units (Celsius). For Fahrenheit, use units=imperial.
+        url = f"{base_url}?q={city}&appid={WEATHER_API_KEY}&units=metric"
+        response = requests.get(url)
+        data = response.json()
+        # OpenWeatherMap returns "cod" == "404" if city is not found
+        if data.get("cod") != 200:
+            return None
+        weather_desc = data["weather"][0]["description"]  # e.g. "light rain"
+        temp_c = data["main"]["temp"]  # current temperature in Celsius
+        return (weather_desc, temp_c)
+    except Exception as e:
+        # If there's a network error or any other issue, handle gracefully
+        return None
+
+import datetime
+
+def get_user_courses(user_id):
+    """Return a list of course codes the user is enrolled in (based on assignments or courses data)."""
+    with init_db() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        result = cur.execute("SELECT DISTINCT course_code FROM user_assignments WHERE user_id=?", (user_id,)).fetchall()
+        return [row["course_code"] for row in result]
+
+def get_course_info(course_code):
+    """Return a dictionary of course details for the given course code, or None if not found."""
+    with init_db() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        row = cur.execute("SELECT * FROM courses WHERE code=?", (course_code,)).fetchone()
+        if row:
+            return {
+                "title": row["title"],
+                "building": row["building"],
+                "room": row["room"],
+                "days": row["days"],
+                "time": row["time"],
+                "instructor": row["instructor"],
+                "ta": row["ta"]
+            }
+        return None
+
+def get_staff_info(course_code):
+    """
+    Return a dictionary with lists of professor(s) and TA(s) for the course.
+    e.g. {"Professor": [(name, email), ...], "TA": [(name, email), ...]}
+    """
+    with init_db() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        staff = {"Professor": [], "TA": []}
+        query = """
+        SELECT people.name, people.email, course_staff.role
+        FROM course_staff
+        JOIN people ON course_staff.person_id = people.id
+        WHERE course_staff.course_code=?
+        """
+        result = cur.execute(query, (course_code,)).fetchall()
+        for row in result:
+            role = row["role"]
+            staff[role].append((row["name"], row["email"]))
+        return staff
+
+def get_office_hours(course_code=None, role=None, person_name=None):
+    """
+    Fetch office hours. If course_code is provided, fetch office hours for that course.
+    You can filter by role ('Professor' or 'TA') or by person_name.
+    If person_name is provided (exact match in people table), it returns that person's office hours (for all their courses).
+    """
+    with init_db() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        office_hours_list = []
+        if person_name:
+            # Look up person by name (case-insensitive match)
+            person = cur.execute("SELECT id, name FROM people WHERE LOWER(name)=?", (person_name.lower(),)).fetchone()
+            if person:
+                person_id = person["id"]
+                rows = cur.execute("""
+                    SELECT course_code, day_time, location
+                    FROM office_hours
+                    WHERE person_id=?""", (person_id,)).fetchall()
+                for row in rows:
+                    office_hours_list.append({
+                        "course_code": row["course_code"],
+                        "day_time": row["day_time"],
+                        "location": row["location"],
+                        "person_name": person["name"]
+                    })
+        elif course_code:
+            # Office hours for all staff in the given course, optionally filter by role
+            query = """
+                SELECT office_hours.day_time, office_hours.location, people.name, course_staff.role
+                FROM office_hours
+                JOIN people ON office_hours.person_id = people.id
+                JOIN course_staff ON course_staff.person_id = people.id AND course_staff.course_code = office_hours.course_code
+                WHERE office_hours.course_code=?
+            """
+            params = [course_code]
+            if role:
+                query += " AND course_staff.role=?"
+                params.append(role)
+            rows = cur.execute(query, tuple(params)).fetchall()
+            for row in rows:
+                office_hours_list.append({
+                    "course_code": course_code,
+                    "day_time": row["day_time"],
+                    "location": row["location"],
+                    "person_name": row["name"],
+                    "role": row["role"]
+                })
+        return office_hours_list
+
+def get_user_assignments(user_id, due_within_days=None, specific_title=None, course_code=None):
+    """
+    Fetch pending assignments for the user.
+    - If due_within_days is provided, get assignments due within that many days from today.
+    - If specific_title is provided, filter assignments whose title contains that substring.
+    - If course_code is provided, filter to that course.
+    Returns a list of dicts with course_code, title, due_date.
+    """
+    with init_db() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        query = "SELECT course_code, title, due_date FROM user_assignments WHERE user_id=? AND status='pending'"
+        params = [user_id]
+        if course_code:
+            query += " AND course_code=?"
+            params.append(course_code)
+        if specific_title:
+            query += " AND LOWER(title) LIKE ?"
+            params.append(f"%{specific_title.lower()}%")
+        if due_within_days is not None:
+            # Calculate date threshold
+            today = datetime.date.today()
+            threshold = today + datetime.timedelta(days=due_within_days)
+            query += " AND due_date <= ?"
+            params.append(threshold.isoformat())
+        # Execute query and fetch results
+        rows = cur.execute(query, tuple(params)).fetchall()
+        assignments = []
+        for row in rows:
+            assignments.append({
+                "course_code": row["course_code"],
+                "title": row["title"],
+                "due_date": row["due_date"]
+            })
+        return assignments
+
+def get_exams(user_id, course_code=None):
+    """
+    Fetch upcoming exams (midterm/final) for the user's courses.
+    If course_code is provided, filter to that course. Otherwise return all exams for courses the user is enrolled in.
+    """
+    with init_db() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        # Get courses for user
+        courses = get_user_courses(user_id)
+        if not courses:
+            return []
+        exams = []
+        for code in courses:
+            if course_code and code != course_code:
+                continue
+            rows = cur.execute("SELECT exam_type, exam_datetime, location FROM exams WHERE course_code=?", (code,)).fetchall()
+            for row in rows:
+                exams.append({
+                    "course_code": code,
+                    "exam_type": row["exam_type"],
+                    "datetime": row["exam_datetime"],
+                    "location": row["location"]
+                })
+        # Filter to future exams only (exams in the past are not relevant)
+        now = datetime.datetime.now()
+        upcoming_exams = []
+        for ex in exams:
+            try:
+                exam_dt = datetime.datetime.fromisoformat(ex["datetime"])
+            except ValueError:
+                exam_dt = None
+            if exam_dt and exam_dt > now:
+                upcoming_exams.append(ex)
+        return upcoming_exams
+
+def get_upcoming_events(days_ahead=7):
+    """
+    Fetch campus events happening within the next `days_ahead` days.
+    """
+    with init_db() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        now = datetime.datetime.now()
+        end_time = now + datetime.timedelta(days=days_ahead)
+        upcoming = []
+        rows = cur.execute("SELECT title, start_datetime, location, url FROM events").fetchall()
+        for row in rows:
+            # Parse the event datetime
+            try:
+                event_dt = datetime.datetime.fromisoformat(row["start_datetime"])
+            except Exception:
+                continue
+            if now <= event_dt <= end_time:
+                upcoming.append({
+                    "title": row["title"],
+                    "datetime": event_dt,
+                    "location": row["location"],
+                    "url": row["url"]
+                })
+        # Sort events by date/time
+        upcoming.sort(key=lambda e: e["datetime"])
+        return upcoming
+
+def get_current_alerts():
+    """
+    Fetch police alerts from today (or very recent). Returns list of alert titles and URLs.
+    """
+    with init_db() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        today_str = datetime.date.today().isoformat()
+        rows = cur.execute("SELECT title, url FROM police_alerts WHERE alert_date >= ?", (today_str,)).fetchall()
+        alerts = [{"title": row["title"], "url": row["url"]} for row in rows]
+        return alerts
+
+import re
+
+def chat_loop(user_id, username):
+    print(f"\nHello {username}! I'm UniBuddy, your campus assistant.")
+    # Fetch and display any current alerts
+    alerts = get_current_alerts()
+    if alerts:
+        for alert in alerts:
+            print(f"**Alert:** {alert['title']} – please be cautious. (Details: {alert['url']})")
+    else:
+        print("No emergency alerts at this time. Stay safe!")
+    # Fetch and display upcoming events (within next 2 days for example)
+    events = get_upcoming_events(days_ahead=2)
+    if events:
+        print("Upcoming events on campus:")
+        for ev in events:
+            # Format date to a readable form
+            date_str = ev["datetime"].strftime("%a %b %d %I:%M %p")
+            print(f"- {ev['title']} on {date_str} at {ev['location']}. More info: {ev['url']}")
+    # Remind about assignments due soon (today or tomorrow)
+    due_soon = get_user_assignments(user_id, due_within_days=1)
+    if due_soon:
+        for task in due_soon:
+            print(f"**Reminder:** {task['title']} for {task['course_code']} is due on {task['due_date']}!")
+            # Update last_notified_at in database for this assignment to avoid repeating soon
+            with init_db() as conn:
+                conn.execute(
+                    "UPDATE user_assignments SET last_notified_at=? WHERE user_id=? AND course_code=? AND title=?",
+                    (datetime.datetime.now().isoformat(), user_id, task['course_code'], task['title'])
+                )
+                conn.commit()
+
+
+    print("How can I assist you today?\n")
+    # Initialize conversation history for context
+    conversation_history = []
+    # Start chat loop
+    while True:
+        try:
+            user_input = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            # Handle abrupt termination
+            print("\nGoodbye!")
+            break
+        if user_input.lower() in {"exit", "quit", "bye"}:
+            print("Bot: Goodbye! Have a great day.")
+            break
+        if user_input == "":
+            continue  # skip empty input
+
+        # Add user message to conversation history
+        conversation_history.append({"role": "user", "content": user_input})
+
+        # Determine how to respond
+        user_message = user_input.lower()
+        response = ""
+        # Check various types of queries by keywords
+        courses = get_user_courses(user_id)
+        mentioned_course = None
+        for code in courses:
+            if code.lower() in user_message:
+                mentioned_course = code
+                break  # pick the first matched course code
+
+        # 1. Greeting or courtesy (simple responses)
+        if user_message in {"hello", "hi", "hey"}:
+            response = f"Hello {username}! How can I help you?"
+        elif user_message in {"thank you", "thanks"}:
+            response = "You're welcome!"
+
+        # 2. Assignment deadlines
+        elif "assignment" in user_message or "deadline" in user_message or "due" in user_message:
+            # Determine if asking about a specific assignment or general
+            # Check for time frame keywords
+            if "tomorrow" in user_message:
+                tasks = get_user_assignments(user_id, due_within_days=1, course_code=mentioned_course)
+                if tasks:
+                    response = "Assignments due by tomorrow:\n"
+                    for task in tasks:
+                        response += f"- {task['course_code']} – {task['title']} (due {task['due_date']})\n"
+                else:
+                    response = "No assignments due by tomorrow."
+            elif "week" in user_message:
+                tasks = get_user_assignments(user_id, due_within_days=7, course_code=mentioned_course)
+                if tasks:
+                    response = "Assignments due in the next week:\n"
+                    for task in tasks:
+                        response += f"- {task['course_code']} – {task['title']} (due {task['due_date']})\n"
+                else:
+                    response = "No assignments due in the next week."
+            else:
+                # Maybe asking about a specific assignment title
+                # Try to extract assignment name/number from the question (e.g., "Assignment 1")
+                match = re.search(r'assignment\s*([\w\d]+)', user_message)
+                if match:
+                    title_query = match.group(0)  # e.g. "assignment 1"
+                    tasks = get_user_assignments(user_id, specific_title=title_query, course_code=mentioned_course)
+                else:
+                    tasks = get_user_assignments(user_id, course_code=mentioned_course)
+                if tasks:
+                    # If only one assignment found, answer directly
+                    if len(tasks) == 1:
+                        task = tasks[0]
+                        response = f"**{task['title']}** for {task['course_code']} is due on {task['due_date']}."
+                    else:
+                        # List multiple assignments
+                        response = "Here are your pending assignments:\n"
+                        for task in tasks:
+                            response += f"- {task['course_code']} – {task['title']} (due {task['due_date']})\n"
+                else:
+                    response = "You have no pending assignments."
+
+        # 3. Exams (midterms/finals)
+        elif "exam" in user_message or "midterm" in user_message or "final" in user_message:
+            exams = get_exams(user_id, course_code=mentioned_course)
+            if exams:
+                response = ""
+                for exam in exams:
+                    date_obj = None
+                    try:
+                        date_obj = datetime.datetime.fromisoformat(exam["datetime"])
+                    except Exception:
+                        pass
+                    date_str = date_obj.strftime("%a %b %d %I:%M %p") if date_obj else exam["datetime"]
+                    response += f"{exam['course_code']} {exam['exam_type']} is on {date_str} at {exam['location']}.\n"
+            else:
+                response = "I didn't find any upcoming exams for your courses."
+
+        # 4. Course schedule or location (class info)
+        elif "class" in user_message or "course" in user_message or "lecture" in user_message:
+            # Check if asking about time/schedule or location
+            course_code = mentioned_course
+            # If user has only one course and didn't specify, use that
+            if not course_code and len(courses) == 1:
+                course_code = courses[0]
+            if course_code:
+                info = get_course_info(course_code)
+                if not info:
+                    response = f"I don't have information on course {course_code}."
+                else:
+                    # If question contains "where", tell building/room (and weather)
+                    if "where" in user_message or "location" in user_message:
+                        # Course location
+                        location = f"{info['building']} room {info['room']}"
+                        response = f"{course_code} ({info['title']}) is held in {location}."
+                        # Include weather info for the campus location
+                        weather = get_weather(CAMPUS_CITY)
+                        if weather:
+                            desc, temp = weather
+                            response += f" Currently, the weather in {CAMPUS_CITY} is {desc} with a temperature of {temp}°C."
+                    # If question contains "when" or "time" or "day", tell schedule
+                    elif "when" in user_message or "time" in user_message or "day" in user_message:
+                        response = f"{course_code} meets on {info['days']} at {info['time']}."
+                    else:
+                        # General course info if not explicitly asking location/time
+                        response = (f"{course_code} – {info['title']} is on {info['days']} at {info['time']}, "
+                                    f"in {info['building']} {info['room']}, taught by {info['instructor']}.")
+            else:
+                # No specific course identified in question
+                if "where" in user_message or "location" in user_message:
+                    # List locations for all courses
+                    all_courses = get_user_courses(user_id)
+                    if all_courses:
+                        response = "Your classes are located at:\n"
+                        for code in all_courses:
+                            info = get_course_info(code)
+                            if info:
+                                response += f"- {code}: {info['building']} {info['room']}\n"
+                    else:
+                        response = "I don't have your course information."
+                elif "when" in user_message or "time" in user_message or "schedule" in user_message:
+                    # List schedule for all courses
+                    all_courses = get_user_courses(user_id)
+                    if all_courses:
+                        response = "Your class schedule:\n"
+                        for code in all_courses:
+                            info = get_course_info(code)
+                            if info:
+                                response += f"- {code}: {info['days']} at {info['time']}\n"
+                    else:
+                        response = "I don't have your course schedule."
+                else:
+                    # General course query without specification
+                    response = "Could you please specify which course or what info about the class you need?"
+
+        # 5. Professor/TA information (availability, office hours, contacts)
+        elif "professor" in user_message or "instructor" in user_message or "ta" in user_message or "teacher" in user_message:
+            # Check if asking for office hours or contact
+            if "office hour" in user_message or "availability" in user_message:
+                # If a course is mentioned, get office hours for that course
+                if mentioned_course:
+                    hours = get_office_hours(course_code=mentioned_course)
+                    if hours:
+                        response = f"Office hours for {mentioned_course}:\n"
+                        for h in hours:
+                            role = h.get("role", "")
+                            name = h["person_name"]
+                            response += f"- {name} ({role}): {h['day_time']} at {h['location']}\n"
+                    else:
+                        response = f"No office hours found for {mentioned_course}."
+                else:
+                    # Maybe a person name is mentioned
+                    # Extract capitalized words as possible name (naive approach)
+                    name_match = re.search(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', user_input)
+                    if name_match:
+                        person_name = name_match.group(0)
+                        hours = get_office_hours(person_name=person_name)
+                        if hours:
+                            response = ""
+                            for h in hours:
+                                response += (f"{h['person_name']}'s office hours for {h['course_code']}: "
+                                            f"{h['day_time']} at {h['location']}.\n")
+                        else:
+                            response = f"Sorry, I don't have office hours info for {person_name}."
+                    else:
+                        # No specific course or name, list all user's course staff office hours
+                        user_courses = get_user_courses(user_id)
+                        if user_courses:
+                            response = "Your instructors' office hours:\n"
+                            for code in user_courses:
+                                hours = get_office_hours(course_code=code)
+                                for h in hours:
+                                    response += (f"- {code} {h['person_name']} ({h.get('role','')}): "
+                                                f"{h['day_time']} at {h['location']}\n")
+                        else:
+                            response = "Please specify a course or person for office hours."
+            elif "email" in user_message or "contact" in user_message:
+                # Looking for contact info (email) for a professor/TA
+                if mentioned_course:
+                    staff = get_staff_info(mentioned_course)
+                    # If asking specifically for professor or TA email
+                    if "professor" in user_message or "instructor" in user_message:
+                        if staff["Professor"]:
+                            name, email = staff["Professor"][0]  # assume first professor
+                            response = f"The professor for {mentioned_course} is {name}. Email: {email}."
+                        else:
+                            response = f"No professor found for {mentioned_course}."
+                    elif "ta" in user_message:
+                        if staff["TA"]:
+                            # If multiple TAs, list them
+                            if len(staff["TA"]) == 1:
+                                name, email = staff["TA"][0]
+                                response = f"The TA for {mentioned_course} is {name}. Email: {email}."
+                            else:
+                                response = f"TAs for {mentioned_course}:\n"
+                                for (name, email) in staff["TA"]:
+                                    response += f"- {name}, Email: {email}\n"
+                        else:
+                            response = f"No TAs found for {mentioned_course}."
+                else:
+                    # Try to find a name in the query and get that person's email
+                    name_match = re.search(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', user_input)
+                    if name_match:
+                        person_name = name_match.group(0)
+                        cur = conn.cursor()
+                        person = cur.execute("SELECT email, role FROM people WHERE LOWER(name)=?", (person_name.lower(),)).fetchone()
+                        if person:
+                            role = person["role"]
+                            email = person["email"]
+                            response = f"{person_name} ({role}) can be reached at {email}."
+                        else:
+                            response = f"Sorry, I don't have contact info for {person_name}."
+                    else:
+                        response = "Whose contact information are you looking for?"
+            else:
+                # Likely asking "Who is the professor/TA for <course>?"
+                if mentioned_course:
+                    staff = get_staff_info(mentioned_course)
+                    # If query mentions 'TA', answer with TAs; if 'professor' or 'instructor', answer with professors
+                    if "ta" in user_message:
+                        if staff["TA"]:
+                            if len(staff["TA"]) == 1:
+                                name = staff["TA"][0][0]
+                                response = f"{name} is the TA for {mentioned_course}."
+                            else:
+                                names = [s[0] for s in staff["TA"]]
+                                response = f"The TAs for {mentioned_course} are: " + ", ".join(names) + "."
+                        else:
+                            response = f"I don't have a TA listed for {mentioned_course}."
+                    else:
+                        if staff["Professor"]:
+                            if len(staff["Professor"]) == 1:
+                                name = staff["Professor"][0][0]
+                                response = f"{name} is the professor for {mentioned_course}."
+                            else:
+                                names = [s[0] for s in staff["Professor"]]
+                                response = f"The professors for {mentioned_course} are: " + ", ".join(names) + "."
+                        else:
+                            response = f"No professor listed for {mentioned_course}."
+                else:
+                    response = "Please specify the course you want to know the professor/TA for."
+
+        # 6. Campus events
+        elif "event" in user_message or "happening" in user_message:
+            upcoming = get_upcoming_events(days_ahead=7)
+            if upcoming:
+                response = "Campus events coming up:\n"
+                for ev in upcoming:
+                    date_str = ev["datetime"].strftime("%b %d %I:%M %p")
+                    response += f"- {ev['title']} on {date_str} at {ev['location']}\n"
+            else:
+                response = "There are no upcoming events in the next week."
+
+        # 7. Safety alerts
+        elif "alert" in user_message or "police" in user_message or "emergency" in user_message:
+            alerts = get_current_alerts()
+            if alerts:
+                response = ""
+                for alert in alerts:
+                    response += f"**Alert:** {alert['title']} (see details: {alert['url']})\n"
+            else:
+                response = "No new police alerts at the moment."
+
+        # 8. Weather query (general)
+        elif "weather" in user_message:
+            # Check if user specified a location in the query
+            city_match = re.search(r'weather in ([\w\s,]+)', user_message)
+            city = CAMPUS_CITY
+            if city_match:
+                # Use the city mentioned by user
+                city = city_match.group(1).strip()
+            weather = get_weather(city)
+            if weather:
+                desc, temp = weather
+                response = f"The current weather in {city} is {desc} with a temperature of {temp}°C."
+            else:
+                response = "I'm sorry, I couldn't retrieve the weather right now."
+
+        # 9. Fallback to OpenAI for general questions or if none of the above rules applied
+        else:
+            try:
+                # Include conversation history for context (cap the history length if needed)
+                chat_completion = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=conversation_history,
+                    temperature=0.7
+                )
+                response = chat_completion.choices[0].message.content.strip()
+            except Exception as e:
+                # If the OpenAI API fails (e.g., no API key or network issue)
+                response = f"(Error calling OpenAI: {e})"
+
+        # Add assistant response to conversation history
+        conversation_history.append({"role": "assistant", "content": response})
+        # Print the response
+        print(f"Bot: {response}")
+
+def main():
+    username = input("Enter your username: ").strip()
+    with init_db() as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        row = cur.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+        if row:
+            user_id = row["id"]
+        else:
+            cur.execute("INSERT INTO users (username) VALUES (?)", (username,))
+            conn.commit()
+            user_id = cur.lastrowid
+    # Pass user_id only; no need to keep conn open
+    chat_loop(user_id, username)
+
+# Run the chatbot
+if __name__ == "__main__":
+    main()
+
