@@ -81,14 +81,6 @@ Then:
 
 ---
 
-## 💬 Example conversation
-
-You: What classes do I have on Tuesday?  
-Chatalogue: Software Engineering — Prof. Bora — Tue 18:00-20:45 — Room 204A
-
-(Exact output depends on the actual content of `chatalogue.sqlite`.)
-
----
 
 ## 🛠 Development notes
 
